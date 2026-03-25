@@ -1,0 +1,12 @@
+[package]
+name = "rusty-parsers"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reqwest = "0.13.2"
+tokio = { version = "1.50.0", features = ["full"] }
+colog = "1.4.0"
+log = "0.4.29"
+scraper = "0.26.0"
+rand = "0.10.0"
