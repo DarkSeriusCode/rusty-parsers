@@ -2,15 +2,15 @@ use std::{
     collections::VecDeque,
     net::{SocketAddr, IpAddr},
     sync::Arc, time::Duration,
+    error::Error,
 };
-
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{
     self,
     Proxy, Client
 };
-
 use tokio::{
-    sync::{mpsc::{self, Sender}, Mutex}, task::JoinSet,
+    sync::Mutex, task::JoinSet,
 };
 
 const GITHUB_URLS: &[&'static str] = &[
@@ -19,7 +19,7 @@ const GITHUB_URLS: &[&'static str] = &[
     "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
 ];
 
-pub async fn fetch_all_proxy() -> Result<VecDeque<SocketAddr>, reqwest::Error> {
+pub async fn fetch_proxies() -> Result<VecDeque<SocketAddr>, reqwest::Error> {
     let client = Client::new();
     let mut proxies = VecDeque::new();
 
@@ -33,7 +33,10 @@ pub async fn fetch_all_proxy() -> Result<VecDeque<SocketAddr>, reqwest::Error> {
     Ok(proxies)
 }
 
-async fn proxy_checker(proxy_list: Arc<Mutex<VecDeque<SocketAddr>>>, tx: Sender<Option<SocketAddr>>) {
+async fn proxy_checker(proxy_list: Arc<Mutex<VecDeque<SocketAddr>>>,
+                       timeout: Duration, progress_bar: ProgressBar) -> Vec<SocketAddr>
+{
+    let mut working_proxies = vec![];
     loop {
         let proxy_to_check = {
             let mut lock = proxy_list.lock().await;
@@ -42,54 +45,59 @@ async fn proxy_checker(proxy_list: Arc<Mutex<VecDeque<SocketAddr>>>, tx: Sender<
             };
             proxy
         };
-        let Ok(proxy_ip) = get_my_ip(Proxy::all(proxy_to_check.to_string()).unwrap()).await else {
-            continue;
+        let ok_ip = get_my_ip(proxy_to_check, timeout).await;
+        progress_bar.inc(1);
+        let proxy_ip = match ok_ip {
+            Ok(ip) => ip,
+            Err(err) => {
+                // progress_bar.suspend(|| { log::warn!("{}", err.source().unwrap().to_string()); });
+                continue;
+            }
         };
-        log::trace!("Checked");
         if proxy_ip == proxy_to_check.ip() {
             continue;
         }
-        // TODO: Handle this mfc
-        let _ = tx.send(Some(proxy_to_check)).await;
+        progress_bar.suspend(|| {
+            log::info!("Found working proxy");
+        });
+        working_proxies.push(proxy_to_check);
     }
+    working_proxies
 }
 
-pub async fn check_proxies(proxies: VecDeque<SocketAddr>, jobs: usize) -> Vec<SocketAddr> {
+pub async fn check_proxies(proxies: VecDeque<SocketAddr>, jobs: usize,
+                           timeout: Duration) -> Vec<SocketAddr>
+{
+    let pb = ProgressBar::new(proxies.len().try_into().unwrap());
+    pb.enable_steady_tick(Duration::from_millis(60));
+    pb.set_style(
+            ProgressStyle::with_template("[{spinner:.green.bold}] |{bar:50}|  {pos}/{len} ({percent}%)")
+            .unwrap().progress_chars("=> "),
+    );
     let proxies = Arc::new(Mutex::new(proxies));
-    let (tx, mut rx) = mpsc::channel(100);
 
     let mut workers_pool = JoinSet::new();
     for _ in 0..jobs {
         let proxies = proxies.clone();
-        let tx = tx.clone();
+        let pb = pb.clone();
         workers_pool.spawn(async move {
-            proxy_checker(proxies, tx).await
+            proxy_checker(proxies, timeout, pb).await
         });
     }
 
-    let working_proxies = tokio::spawn(async move {
-        let mut working_proxies = vec![];
-        while let Some(ip) = rx.recv().await {
-            log::error!("Found working IP");
-            working_proxies.push(ip);
-        }
-        working_proxies
-    });
-
-    let res = tokio::join!(
-        working_proxies,
-        workers_pool.join_all(),
-    );
-
-    dbg!(res);
-
-    unimplemented!();
+    let result = workers_pool.join_all().await
+        .iter().flatten()
+        .map(|s| s.to_owned())
+        .collect::<Vec<SocketAddr>>();
+    pb.finish_and_clear();
+    result
 }
 
-pub async fn get_my_ip(proxy: Proxy) -> Result<IpAddr, reqwest::Error> {
+pub async fn get_my_ip(proxy_addr: SocketAddr, timeout: Duration) -> Result<IpAddr, reqwest::Error> {
     let client = Client::builder()
-        .connect_timeout(Duration::new(5, 0))
-        .proxy(proxy.clone())
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .proxy(Proxy::all(proxy_addr.to_string())?)
         .build().unwrap();
     let ip = client.get("https://api.ipify.org").send().await?.text().await?;
     Ok(ip.parse().unwrap())
